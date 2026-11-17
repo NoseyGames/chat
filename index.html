@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Serverless E2EE Room Chat</title>
+  <script src="https://unpkg.com"></script>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 600px; margin: 2rem auto; padding: 0 1rem; background: #121212; color: #eee; }
+    .card { background: #1e1e1e; padding: 1.5rem; border-radius: 8px; margin-bottom: 1rem; border: 1px solid #2c2c2c; }
+    input, button { padding: 0.65rem; font-size: 1rem; border-radius: 6px; border: 1px solid #333; }
+    input { background: #2a2a2a; color: #fff; width: 100%; box-sizing: border-box; margin-bottom: 0.75rem; }
+    button { background: #2563eb; color: white; border: none; cursor: pointer; font-weight: 600; width: 100%; }
+    button:hover { background: #1d4ed8; }
+    button:disabled { background: #444; cursor: not-allowed; }
+    #chat-box { height: 320px; overflow-y: auto; border: 1px solid #333; padding: 1rem; margin-bottom: 1rem; border-radius: 6px; background: #161616; }
+    .msg { margin-bottom: 0.6rem; line-height: 1.4; }
+    .sys { color: #888; font-style: italic; font-size: 0.85rem; }
+    .hidden { display: none; }
+    .badge { background: #10b981; color: #052e16; padding: 0.25rem 0.6rem; border-radius: 4px; font-size: 0.75rem; font-weight: 700; }
+    .code-box { background: #000; padding: 0.5rem 0.75rem; border-radius: 4px; font-family: monospace; font-size: 1.1rem; letter-spacing: 1px; color: #38bdf8; user-select: all; }
+  </style>
+</head>
+<body>
+
+  <!-- Lobby View -->
+  <div id="lobby" class="card">
+    <h2 style="margin-top: 0;">🔒 Serverless E2EE Chat</h2>
+    <p style="color: #aaa; font-size: 0.9rem;">100% client-side P2P chat. No database, no backend server.</p>
+    
+    <input type="text" id="username" placeholder="Your display name" />
+    <button id="create-btn">Create New Room</button>
+
+    <hr style="border: 0; border-top: 1px solid #333; margin: 1.5rem 0;" />
+
+    <input type="text" id="room-code-input" placeholder="Paste Room Code (e.g. A1B2C3-D4E5F6)" />
+    <button id="join-btn" style="background: #059669;">Join Existing Room</button>
+    <p id="status-text" style="color: #f59e0b; font-size: 0.9rem; margin-bottom: 0;"></p>
+  </div>
+
+  <!-- Chat Room View -->
+  <div id="room" class="card hidden">
+    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem; flex-wrap: wrap; gap: 0.5rem;">
+      <div>
+        <span style="font-size: 0.85rem; color: #aaa;">Share Code:</span>
+        <span id="display-code" class="code-box"></span>
+      </div>
+      <span class="badge">AES-256-GCM P2P</span>
+    </div>
+
+    <div id="chat-box"></div>
+
+    <form id="msg-form" style="display: flex; gap: 0.5rem;">
+      <input type="text" id="msg-input" placeholder="Write an encrypted message..." autocomplete="off" style="margin: 0;" />
+      <button type="submit" style="width: auto; padding: 0 1.25rem;">Send</button>
+    </form>
+  </div>
+
+  <script>
+    const PEER_PREFIX = 'gh-e2ee-room-';
+    let peer = null;
+    let cryptoKey = null;
+    let myName = '';
+    let isHost = false;
+    const connections = new Map(); // Stores active WebRTC data connections
+
+    // Generate random 6-char hex string
+    function randomHex(bytes = 3) {
+      const arr = new Uint8Array(bytes);
+      window.crypto.getRandomValues(arr);
+      return Array.from(arr).map(b => b.toString(16).padStart(2, '0')).join('').toUpperCase();
+    }
+
+    // Derive AES-256-GCM key solely from the secret half of the code
+    async function deriveKey(secretPart) {
+      const enc = new TextEncoder();
+      const keyMaterial = await window.crypto.subtle.importKey(
+        'raw', enc.encode(secretPart), { name: 'PBKDF2' }, false, ['deriveKey']
+      );
+      return window.crypto.subtle.deriveKey(
+        {
+          name: 'PBKDF2',
+          salt: enc.encode('github-static-e2ee-salt'),
+          iterations: 100000,
+          hash: 'SHA-256'
+        },
+        keyMaterial,
+        { name: 'AES-GCM', length: 256 },
+        false,
+        ['encrypt', 'decrypt']
+      );
+    }
+
+    async function encryptPayload(obj) {
+      const enc = new TextEncoder();
+      const iv = window.crypto.getRandomValues(new Uint8Array(12));
+      const ciphertext = await window.crypto.subtle.encrypt(
+        { name: 'AES-GCM', iv },
+        cryptoKey,
+        enc.encode(JSON.stringify(obj))
+      );
+      return { iv: Array.from(iv), ciphertext: Array.from(new Uint8Array(ciphertext)) };
+    }
+
+    async function decryptPayload(data) {
+      try {
+        const decrypted = await window.crypto.subtle.decrypt(
+          { name: 'AES-GCM', iv: new Uint8Array(data.iv) },
+          cryptoKey,
+          new Uint8Array(data.ciphertext)
+        );
+        return JSON.parse(new TextDecoder().decode(decrypted));
+      } catch {
+        return null;
+      }
+    }
+
+    function addLog(text, isSystem = false) {
+      const box = document.getElementById('chat-box');
+      const div = document.createElement('div');
+      div.className = isSystem ? 'msg sys' : 'msg';
+      div.textContent = text;
+      box.appendChild(div);
+      box.scrollTop = box.scrollHeight;
+    }
+
+    function setStatus(msg) {
+      document.getElementById('status-text').textContent = msg;
+    }
+
+    function switchToChat(fullCode) {
+      document.getElementById('lobby').classList.add('hidden');
+      document.getElementById('room').classList.remove('hidden');
+      document.getElementById('display-code').textContent = fullCode;
+      addLog('End-to-end encryption active. Share the code above so others can join.', true);
+    }
+
+    // Handle incoming WebRTC connection (used by Host to relay encrypted packets to other peers)
+    function setupConnection(conn) {
+      conn.on('open', () => {
+        connections.set(conn.peer, conn);
+        if (isHost) {
+          broadcastEncrypted({ type: 'sys', text: 'A participant joined the room.' }, conn.peer);
+          addLog('A participant joined the room.', true);
+        }
+      });
+
+      conn.on('data', async (encryptedPacket) => {
+        // If Host, relay the still-encrypted packet to all other connected guests
+        if (isHost) {
+          connections.forEach((otherConn, peerId) => {
+            if (peerId !== conn.peer && otherConn.open) {
+              otherConn.send(encryptedPacket);
+            }
+          });
+        }
+
+        const msg = await decryptPayload(encryptedPacket);
+        if (!msg) return addLog('[Failed to decrypt message - wrong key]', true);
+
+        if (msg.type === 'sys') {
+          addLog(msg.text, true);
+        } else {
+          addLog(`${msg.sender}: ${msg.text}`);
+        }
+      });
+
+      conn.on('close', () => {
+        connections.delete(conn.peer);
+        if (isHost) {
+          broadcastEncrypted({ type: 'sys', text: 'A participant left the room.' });
+          addLog('A participant left the room.', true);
+        } else {
+          addLog('Host disconnected. Room closed.', true);
+        }
+      });
+    }
+
+    async function broadcastEncrypted(payloadObj, excludePeerId = null) {
+      const encrypted = await encryptPayload(payloadObj);
+      connections.forEach((conn, peerId) => {
+        if (peerId !== excludePeerId && conn.open) {
+          conn.send(encrypted);
+        }
+      });
+    }
+
+    // CREATE ROOM (Acts as P2P Star-Hub)
+    document.getElementById('create-btn').onclick = async () => {
+      myName = document.getElementById('username').value.trim() || 'Host';
+      const roomId = randomHex(3);
+      const secretKey = randomHex(3);
+      const fullCode = `${roomId}-${secretKey}`;
+
+      setStatus('Generating room...');
+      isHost = true;
+      cryptoKey = await deriveKey(secretKey);
+
+      peer = new Peer(PEER_PREFIX + roomId);
+      peer.on('open', () => switchToChat(fullCode));
+      peer.on('connection', (conn) => setupConnection(conn));
+      peer.on('error', (err) => setStatus('Error: ' + err.message));
+    };
+
+    // JOIN ROOM (Connects directly to Host)
+    document.getElementById('join-btn').onclick = async () => {
+      myName = document.getElementById('username').value.trim() || 'Guest';
+      const rawCode = document.getElementById('room-code-input').value.trim().toUpperCase();
+      const parts = rawCode.split('-');
+
+      if (parts.length !== 2 || !parts[0] || !parts[1]) {
+        return setStatus('Invalid format. Expected format: XXXXXX-XXXXXX');
+      }
+
+      const [roomId, secretKey] = parts;
+      setStatus('Connecting to room peer...');
+      isHost = false;
+      cryptoKey = await deriveKey(secretKey);
+
+      peer = new Peer();
+      peer.on('open', () => {
+        const conn = peer.connect(PEER_PREFIX + roomId, { reliable: true });
+        conn.on('open', () => {
+          setupConnection(conn);
+          switchToChat(rawCode);
+        });
+        conn.on('error', () => setStatus('Could not reach room.'));
+      });
+      peer.on('error', () => setStatus('Room not found or host is offline.'));
+    };
+
+    // SEND MESSAGE
+    document.getElementById('msg-form').onsubmit = async (e) => {
+      e.preventDefault();
+      const input = document.getElementById('msg-input');
+      const text = input.value.trim();
+      if (!text) return;
+
+      await broadcastEncrypted({ type: 'chat', sender: myName, text });
+      addLog(`You: ${text}`);
+      input.value = '';
+    };
+  </script>
+</body>
+</html>
