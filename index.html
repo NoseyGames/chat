@@ -47,14 +47,14 @@
   <!-- Lobby View -->
   <div id="lobby" class="card">
     <h2 style="margin-top: 0; display: flex; align-items: center; gap: 0.5rem;">Serverless E2EE Chat</h2>
-    <p style="color: var(--text-muted); font-size: 0.9rem; margin-top: 0;">Multi-user client-side P2P encrypted chat. Rehostable on any domain or subpath.</p>
+    <p style="color: var(--text-muted); font-size: 0.9rem; margin-top: 0;">4-character ephemeral rooms with client-side E2EE. Rehostable on any domain or subpath.</p>
 
     <input type="text" id="username" placeholder="Your display name" autocomplete="nickname" />
-    <button id="create-btn">Create New Room</button>
+    <button id="create-btn">Create 4-Char Room</button>
 
     <hr />
 
-    <input type="text" id="room-code-input" placeholder="Room Code (ROOMID-SECRETKEY)" />
+    <input type="text" id="room-code-input" placeholder="Room Code (e.g. A7F3-SECRETKEY)" />
     <button id="join-btn" class="success">Join Existing Room</button>
     <p id="status-text" style="color: #f59e0b; font-size: 0.9rem; margin-bottom: 0; min-height: 1.2rem;"></p>
   </div>
@@ -63,10 +63,10 @@
   <div id="room" class="card hidden">
     <div class="toolbar">
       <span class="badge">AES-256-GCM P2P</span>
-      <span id="peer-count" style="font-size: 0.85rem; color: var(--text-muted);">1 connected</span>
+      <span id="peer-count" style="font-size: 0.85rem; color: var(--text-muted);">1 participant in room</span>
       <div class="actions">
         <button type="button" id="copy-link-btn" class="secondary">Copy Share Link</button>
-        <button type="button" id="leave-btn" class="danger">Leave</button>
+        <button type="button" id="leave-btn" class="danger">Leave &amp; Close</button>
       </div>
     </div>
 
@@ -85,10 +85,12 @@
 
   <script>
     const PEER_PREFIX = 'gh-e2ee-room-';
+    const ROOM_ID_BYTES = 2; // 2 bytes = 4 hex characters
     let peer = null;
     let cryptoKey = null;
     let myName = '';
     let isHost = false;
+    let hasHadGuests = false;
     let currentFullCode = '';
     const connections = new Map();
 
@@ -143,7 +145,7 @@
 
     function updatePeerCount() {
       const activeGuests = Array.from(connections.values()).filter(c => c.open).length;
-      const total = isHost ? activeGuests + 1 : activeGuests + 1;
+      const total = activeGuests + 1;
       document.getElementById('peer-count').textContent =
         `${total} ${total === 1 ? 'participant' : 'participants'} in room`;
     }
@@ -168,6 +170,7 @@
 
     function switchToChat(fullCode) {
       currentFullCode = fullCode;
+      hasHadGuests = false;
       document.getElementById('lobby').classList.add('hidden');
       document.getElementById('room').classList.remove('hidden');
       document.getElementById('chat-box').innerHTML = '';
@@ -175,10 +178,10 @@
       window.history.replaceState(null, '', '#room=' + encodeURIComponent(fullCode));
       document.getElementById('display-code').textContent = fullCode;
       updatePeerCount();
-      addLog('End-to-end encryption active. Share the room link or code with multiple participants.', true);
+      addLog('End-to-end encryption active. Room disappears once everyone leaves.', true);
     }
 
-    function leaveRoom(reason = 'You left the room.') {
+    function destroyRoomState() {
       connections.forEach((conn) => {
         try { conn.close(); } catch {}
       });
@@ -189,7 +192,12 @@
       }
       cryptoKey = null;
       isHost = false;
+      hasHadGuests = false;
       currentFullCode = '';
+    }
+
+    function leaveRoom(reason = 'Room closed and removed.') {
+      destroyRoomState();
       window.history.replaceState(null, '', window.location.pathname + window.location.search);
       document.getElementById('room').classList.add('hidden');
       document.getElementById('lobby').classList.remove('hidden');
@@ -199,6 +207,7 @@
     function setupConnection(conn) {
       const onOpen = () => {
         connections.set(conn.peer, conn);
+        hasHadGuests = true;
         updatePeerCount();
         if (isHost) {
           broadcastEncrypted({ type: 'sys', text: 'A participant joined the room.' }, conn.peer);
@@ -237,8 +246,12 @@
         if (isHost) {
           broadcastEncrypted({ type: 'sys', text: 'A participant left the room.' });
           addLog('A participant left the room.', true);
+          if (hasHadGuests && connections.size === 0) {
+            addLog('All guests left. Room will close when you leave or disconnect.', true);
+          }
         } else {
-          addLog('Host disconnected. Room closed.', true);
+          addLog('Host disconnected. Room deleted.', true);
+          destroyRoomState();
         }
       });
     }
@@ -264,6 +277,7 @@
 
     window.addEventListener('DOMContentLoaded', loadRoomFromHash);
     window.addEventListener('hashchange', loadRoomFromHash);
+    window.addEventListener('beforeunload', () => destroyRoomState());
 
     document.getElementById('copy-link-btn').onclick = async () => {
       if (!currentFullCode) return;
@@ -276,22 +290,22 @@
       }
     };
 
-    document.getElementById('leave-btn').onclick = () => leaveRoom('You left the room.');
+    document.getElementById('leave-btn').onclick = () => leaveRoom('Room closed after leaving.');
 
     document.getElementById('create-btn').onclick = async () => {
       myName = document.getElementById('username').value.trim() || 'Host';
-      const roomId = randomHex(4);
+      const roomId = randomHex(ROOM_ID_BYTES);
       const secretKey = randomHex(16);
       const fullCode = `${roomId}-${secretKey}`;
 
-      setStatus('Initializing secure room...');
+      setStatus('Initializing 4-character room...');
       isHost = true;
       cryptoKey = await deriveKey(secretKey);
 
       peer = new Peer(PEER_PREFIX + roomId);
       peer.on('open', () => switchToChat(fullCode));
       peer.on('connection', (conn) => setupConnection(conn));
-      peer.on('error', (err) => setStatus('Error: ' + (err.type === 'unavailable-id' ? 'Room ID taken. Try again.' : err.message)));
+      peer.on('error', (err) => setStatus('Error: ' + (err.type === 'unavailable-id' ? '4-char ID in use. Click Create again.' : err.message)));
     };
 
     document.getElementById('join-btn').onclick = async () => {
@@ -300,11 +314,15 @@
       const dashIndex = rawCode.indexOf('-');
 
       if (dashIndex <= 0 || dashIndex === rawCode.length - 1) {
-        return setStatus('Invalid format. Expected: ROOMID-SECRETKEY');
+        return setStatus('Invalid format. Expected: XXXX-SECRETKEY');
       }
 
       const roomId = rawCode.slice(0, dashIndex);
       const secretKey = rawCode.slice(dashIndex + 1);
+      if (roomId.length !== 4) {
+        return setStatus('Room ID must be 4 characters (e.g. A7F3).');
+      }
+
       setStatus('Connecting to room...');
       isHost = false;
       cryptoKey = await deriveKey(secretKey);
@@ -318,7 +336,7 @@
         });
         conn.on('error', () => setStatus('Could not reach room.'));
       });
-      peer.on('error', () => setStatus('Connection error. Host may be offline.'));
+      peer.on('error', () => setStatus('Connection error. Room may have expired.'));
     };
 
     document.getElementById('msg-form').onsubmit = async (e) => {
